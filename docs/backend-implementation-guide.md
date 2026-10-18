@@ -784,6 +784,14 @@ flowchart TD
    (`SESSION_LIFETIME=43200`), so the last location, units and language live in
    an encrypted browser cookie and survive server restarts and free-tier sleeps.
    Cache uses the `file` store.
+5. **Shared-IP rate limiting on hosts like Render.** Open-Meteo applies free-tier
+   limits *per IP address*, so hosting providers that share an outbound IP (Render,
+   Vercel, Netlify) are throttled early and the forecast call returns HTTP 429
+   (`errors.rate_limited`). Open-Meteo's terms recommend Cloudflare Workers for
+   this. Deploy `cloudflare/open-meteo-proxy.js` as a Worker and set
+   `OPEN_METEO_FORECAST_URL` to `https://<worker>.workers.dev/v1/forecast`. The
+   Worker qualifies as a Cloudflare user, so the limit is applied per user and the
+   429 disappears. No application code changes.
 
 ---
 

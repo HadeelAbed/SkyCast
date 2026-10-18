@@ -121,5 +121,5 @@
     "footer.description": "Thoughtful forecasts for wherever the day takes you.",
     "footer.attribution": "Weather data by Open-Meteo.",
     "footer.privacy": "Privacy",
-    "footer.privacy_note": "City selections stay in this page session. Your location is only used to fetch weather and is never stored."
+    "footer.privacy_note": "Your last city, units and language stay in your browser for up to 30 days. Your location is only used to fetch weather and is never stored."
 }
