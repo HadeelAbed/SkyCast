@@ -780,7 +780,10 @@ flowchart TD
    navigation; there is no client-side state manager by design.
 4. **No database schema was added.** Laravel's default `users`/`cache`/`jobs`
    migrations remain because the fresh scaffold created them; SkyCast uses none
-   of them (sessions/cache use the framework defaults).
+   of them. Sessions use the **`cookie`** driver with a 30-day lifetime
+   (`SESSION_LIFETIME=43200`), so the last location, units and language live in
+   an encrypted browser cookie and survive server restarts and free-tier sleeps.
+   Cache uses the `file` store.
 
 ---
 

@@ -19,7 +19,9 @@ services:
       - key: LOG_CHANNEL
         value: stderr
       - key: SESSION_DRIVER
-        value: file
+        value: cookie
+      - key: SESSION_LIFETIME
+        value: "43200"
       - key: CACHE_STORE
         value: file
       - key: QUEUE_CONNECTION
