@@ -4,6 +4,7 @@ namespace App\Providers;
 
 use App\Services\GeocodingService;
 use App\Services\WeatherService;
+use Illuminate\Support\Facades\URL;
 use Illuminate\Support\ServiceProvider;
 
 class AppServiceProvider extends ServiceProvider
@@ -47,6 +48,9 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        //
+        // Behind a TLS-terminating proxy (e.g. Render), generate https URLs.
+        if ($this->app->environment('production')) {
+            URL::forceScheme('https');
+        }
     }
 }
