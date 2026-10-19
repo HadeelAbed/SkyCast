@@ -833,24 +833,39 @@ source produced the data.
   is skipped entirely, so the app runs Open-Meteo-only with no configuration.
 - **Triggers**: any `WeatherException` — rate limit (429), 5xx, 401/403, timeout
   (`ConnectionException`) or a malformed payload — moves to the next provider.
-  Gaps in a *successful* response (`null` values) do not.
+  A non-`WeatherException` thrown while a provider normalizes its payload (a
+  provider bug) is converted to a malformed-response error, so it fails over
+  instead of surfacing a 500. Gaps in a *successful* response (`null` values)
+  do not trigger failover.
 - **Circuit breaker**: after `SKYCAST_PROVIDER_BREAKER_THRESHOLD` consecutive
   failures (default 3) a provider is skipped for `SKYCAST_PROVIDER_BREAKER_COOLDOWN`
   minutes (default 5). A single success resets the counter. If *every* provider is
   down, the service still attempts them in order rather than leaving the user with
   no weather; if all fail, the last error surfaces through the normal error path.
+- **Per request**: a provider that already failed for `current()` is not retried
+  for `forecast()` in the same render, so a total outage costs one round of
+  timeouts rather than two.
 
 ### 8.3 Visual Crossing mapping
 
 - **Request**: `GET {url}/{lat},{lon}?key=...&unitGroup=metric|us&include=current,hours,days&contentType=json`.
-- **Time**: Visual Crossing returns local datetimes plus a `tzoffset` (hours). Each
-  record is converted to the underlying UTC instant (`parse(local, 'UTC')->subHours(offset)`),
-  with a per-record `tzoffset` (DST change) taking priority over the day's and the
-  location's. `timezone_offset` is the top-level `tzoffset * 3600`.
+- **Time**: hourly `datetime` and daily `sunrise`/`sunset` are **time-only** strings
+  (`"12:00:00"`), so they are anchored to their day; `currentConditions.datetime`
+  is a full datetime. A record's own epoch (`datetimeEpoch`, `sunriseEpoch`,
+  `sunsetEpoch`, `offsetseconds`) is preferred when present. Records carry a
+  `tzoffset` in hours (possibly fractional, e.g. `5.5`); each is converted to the
+  underlying UTC instant, with a per-record offset (DST change) taking priority
+  over the day's and the location's. `timezone_offset` is the top-level
+  `tzoffset * 3600` (rounded). The 24-hour window starts at the local hour
+  containing the current time, so 12:30 selects the 12:00 bucket.
 - **Fields**: `temp`, `feelslike`, `humidity`, `pressure`, `windspeed`, `winddir`,
   `visibility`, `cloudcover`, `uvindex` (current); `tempmin`/`tempmax`/`uvindex`/`sunrise`/`sunset`/`precipprob`
   (daily); `temp`/`feelslike`/`humidity`/`windspeed`/`precipprob` (hourly).
-  `precipprob` (0–100) becomes `pop` (0–1). Missing fields normalize to `null`.
+  `precipprob` (0–100) becomes `pop` (0–1). `visibility` is reported in kilometres
+  (`metric`) or miles (`us`) and is converted to metres to match Open-Meteo.
+  Missing fields normalize to `null`.
+- **Daily**: Visual Crossing defaults to 15 days; the provider trims to the 7-day
+  contract with `array_slice`.
 - **Icons**: Visual Crossing icons map to the same `weather.*` translation keys as
   Open-Meteo's WMO codes; unknown icons fall back to `overcast`. `-night` sets
   `is_day = false`.
@@ -982,8 +997,8 @@ php artisan route:list
 | `app/Services/GeocodingService.php` | Created | City ⇄ coordinates (Open-Meteo + Nominatim search fallback + reverse), 24h cache | Tested |
 | `app/Services/Contracts/WeatherProvider.php` | Created | Provider interface (`name`/`capabilities`/`current`/`forecast`) | Tested |
 | `app/Services/Providers/OpenMeteoProvider.php` | Renamed from `WeatherService.php` | Open-Meteo current + 24h hourly + 7-day daily, WMO mapping, single cached payload, capabilities | Tested |
-| `app/Services/Providers/VisualCrossingProvider.php` | Created | Visual Crossing timeline → identical normalized shape; per-record tzoffset handling | Tested |
-| `app/Services/FailoverWeatherService.php` | Created | Tries providers in order, first success wins; rethrows the last error | Tested |
+| `app/Services/Providers/VisualCrossingProvider.php` | Created | Visual Crossing timeline → identical normalized shape; time-only fields anchored to their day, epoch preferred, fractional tzoffset, visibility → metres, 7-day trim | Tested |
+| `app/Services/FailoverWeatherService.php` | Created | Tries providers in order, first success wins; normalization crashes fail over; per-request failure memory; rethrows the last error | Tested |
 | `app/Services/ProviderHealth.php` | Created | Per-provider circuit breaker (failure counter + cooldown) | Tested |
 | `app/Providers/AppServiceProvider.php` | Modified | Bind geocoding + failover weather provider with config values; force https in production | Tested |
 | `app/Http/Middleware/SetLocale.php` | Created | Apply session locale to each request | Tested |
@@ -1004,7 +1019,7 @@ php artisan route:list
 | `tests/Feature/WeatherTest.php` | Created | Open-Meteo backend behaviours (incl. saved-location home + auto-locate) with `Http::fake` | Tested |
 | `tests/Feature/LanguageTest.php` | Created | Locale switching and RTL/LTR behaviour | Tested |
 | `tests/Feature/ProviderBindingTest.php` | Created | Container resolves the failover weather provider | Tested |
-| `tests/Feature/VisualCrossingProviderTest.php` | Created | Visual Crossing normalization (midnight-spanning window, per-record tzoffset, missing fields) | Tested |
+| `tests/Feature/VisualCrossingProviderTest.php` | Created | Visual Crossing normalization (time-only hours/sunrise/sunset, epoch preference, fractional tzoffset, 7-day bound, visibility conversion, missing fields) | Tested |
 | `tests/Feature/FailoverWeatherTest.php` | Created | End-to-end failover: primary 429 → fallback provider answers; no key → error surfaced | Tested |
 | `tests/Feature/GeocodingFallbackTest.php` | Created | Forward-geocoding fallback to Nominatim; empty result does not crash | Tested |
 | `tests/Unit/ProviderHealthTest.php` | Created | Circuit breaker threshold, per-provider isolation, reset on success | Tested |

@@ -16,8 +16,10 @@ use Throwable;
  * produces, so nothing downstream learns which provider answered.
  *
  * Visual Crossing returns local datetimes plus a per-record timezone offset
- * (in hours); every timestamp here is converted to the underlying UTC instant
- * so local display stays correct even across a DST change inside the window.
+ * (in hours, sometimes fractional); every timestamp here is converted to the
+ * underlying UTC instant so local display stays correct even across a DST
+ * change inside the window. Day-level fields (hourly `datetime`, `sunrise`,
+ * `sunset`) arrive as time-only strings and are anchored to their day.
  *
  * Nothing here invents data: any value the provider omits stays null.
  */
@@ -51,6 +53,14 @@ class VisualCrossingProvider implements WeatherProvider
         'thunder-showers-night' => ['Thunderstorm', 'thunderstorm'],
     ];
 
+    /**
+     * The daily view is a 7-day forecast; Visual Crossing defaults to 15 days,
+     * so the extra rows are trimmed before they reach the interface.
+     */
+    private const FORECAST_DAYS = 7;
+
+    private const HOURS_PER_FORECAST = 24;
+
     public function __construct(
         private readonly string $url,
         private readonly string $key,
@@ -76,8 +86,8 @@ class VisualCrossingProvider implements WeatherProvider
             'hourly' => true,
             'hourly_granularity_hours' => 1,
             'daily' => true,
-            'daily_days' => 7,
-            'nominal_coverage_days' => 7,
+            'daily_days' => self::FORECAST_DAYS,
+            'nominal_coverage_days' => self::FORECAST_DAYS,
             'seven_day_forecast' => true,
         ];
     }
@@ -95,12 +105,12 @@ class VisualCrossingProvider implements WeatherProvider
             throw WeatherException::malformed('Visual Crossing current block was missing.');
         }
 
-        $offset = $this->offsetHours($payload, $current);
+        $day = is_array($payload['days'][0] ?? null) ? $payload['days'][0] : [];
+        $dayDate = is_string($day['datetime'] ?? null) ? $day['datetime'] : null;
+        $offset = $this->offsetSeconds($payload, $current, $day);
+
         $isDay = $this->isDay((string) ($current['icon'] ?? ''));
         [$main, $key] = self::ICONS[$current['icon'] ?? ''] ?? ['Clouds', 'overcast'];
-
-        $day = is_array($payload['days'][0] ?? null) ? $payload['days'][0] : [];
-        $dayOffset = $this->offsetHours($payload, $day);
 
         return [
             'provider' => $this->name(),
@@ -110,19 +120,19 @@ class VisualCrossingProvider implements WeatherProvider
             'pressure' => $current['pressure'] ?? null,
             'wind_speed' => $current['windspeed'] ?? null,
             'wind_deg' => $current['winddir'] ?? null,
-            'visibility' => $current['visibility'] ?? null,
+            'visibility' => $this->visibilityMeters($current['visibility'] ?? null, $units),
             'clouds' => $current['cloudcover'] ?? null,
             'uv_index' => $current['uvindex'] ?? null,
             'is_day' => $isDay,
-            'sunrise' => $this->isoFromLocal($day['sunrise'] ?? null, $dayOffset),
-            'sunset' => $this->isoFromLocal($day['sunset'] ?? null, $dayOffset),
-            'timezone_offset' => $this->locationOffset($payload) * 3600,
+            'sunrise' => $this->eventIso($day, 'sunrise', $dayDate, $offset),
+            'sunset' => $this->eventIso($day, 'sunset', $dayDate, $offset),
+            'timezone_offset' => $this->locationOffsetSeconds($payload),
             'condition' => $main,
             'description' => __('weather.'.$key, [], $locale),
             'icon' => $isDay ? '01d' : '01n',
             'icon_url' => null,
             'observed_at' => CarbonImmutable::createFromTimestamp(
-                $this->timestamp((string) $current['datetime'], $offset)
+                $this->instant($current, $dayDate, $offset)
             )->toIso8601String(),
         ];
     }
@@ -140,7 +150,8 @@ class VisualCrossingProvider implements WeatherProvider
             throw WeatherException::malformed('Visual Crossing response was missing daily data.');
         }
 
-        $defaultOffset = $this->locationOffset($payload);
+        $days = array_slice(array_values($days), 0, self::FORECAST_DAYS);
+        $defaultOffset = $this->locationOffsetSeconds($payload);
 
         $allHours = [];
 
@@ -149,19 +160,27 @@ class VisualCrossingProvider implements WeatherProvider
                 continue;
             }
 
+            $dayDate = is_string($day['datetime'] ?? null) ? $day['datetime'] : null;
+
             foreach ($day['hours'] ?? [] as $hour) {
                 if (! is_array($hour) || ! isset($hour['datetime'])) {
                     continue;
                 }
 
-                $allHours[] = $this->normalizeHour($hour, $this->offsetHours($payload, $hour, $day), $locale);
+                $allHours[] = $this->normalizeHour($hour, $this->offsetSeconds($payload, $hour, $day), $dayDate, $locale);
             }
         }
 
         usort($allHours, static fn (array $a, array $b): int => $a['timestamp'] <=> $b['timestamp']);
 
-        $start = $this->currentHourIndex($allHours, $this->currentTimestamp($payload, $defaultOffset));
-        $hourly = array_slice($allHours, $start, 24);
+        $firstDay = is_array($days[0] ?? null) ? $days[0] : [];
+        $current = is_array($payload['currentConditions'] ?? null) ? $payload['currentConditions'] : [];
+        $currentOffset = $this->offsetSeconds($payload, $current, $firstDay);
+        $start = $this->currentHourIndex(
+            $allHours,
+            $this->floorToLocalHour($this->instant($current, $firstDay['datetime'] ?? null, $currentOffset), $currentOffset),
+        );
+        $hourly = array_slice($allHours, $start, self::HOURS_PER_FORECAST);
 
         $daily = [];
 
@@ -170,12 +189,13 @@ class VisualCrossingProvider implements WeatherProvider
                 continue;
             }
 
-            $offset = $this->offsetHours($payload, $day);
+            $dayDate = (string) $day['datetime'];
+            $offset = $this->offsetSeconds($payload, $day);
             [$main, $key] = self::ICONS[$day['icon'] ?? ''] ?? ['Clouds', 'overcast'];
 
             $daily[] = [
-                'timestamp' => $this->timestamp($day['datetime'].'T00:00:00', $offset),
-                'date' => $day['datetime'],
+                'timestamp' => $this->instant($day, $dayDate, $offset),
+                'date' => $dayDate,
                 'temp_min' => $day['tempmin'] ?? null,
                 'temp_max' => $day['tempmax'] ?? null,
                 'humidity' => null,
@@ -186,8 +206,8 @@ class VisualCrossingProvider implements WeatherProvider
                 'description' => __('weather.'.$key, [], $locale),
                 'icon' => '01d',
                 'icon_url' => null,
-                'sunrise' => $this->isoFromLocal($day['sunrise'] ?? null, $offset),
-                'sunset' => $this->isoFromLocal($day['sunset'] ?? null, $offset),
+                'sunrise' => $this->eventIso($day, 'sunrise', $dayDate, $offset),
+                'sunset' => $this->eventIso($day, 'sunset', $dayDate, $offset),
             ];
         }
 
@@ -195,7 +215,7 @@ class VisualCrossingProvider implements WeatherProvider
             'provider' => $this->name(),
             'hourly' => $hourly,
             'daily' => $daily,
-            'timezone_offset' => $defaultOffset * 3600,
+            'timezone_offset' => $defaultOffset,
             'capabilities' => [
                 'plan' => 'visual-crossing',
                 'current' => true,
@@ -203,8 +223,8 @@ class VisualCrossingProvider implements WeatherProvider
                 'hourly_granularity_hours' => 1,
                 'daily' => ! empty($daily),
                 'daily_days' => count($daily),
-                'nominal_coverage_days' => 7,
-                'seven_day_forecast' => count($daily) >= 7,
+                'nominal_coverage_days' => self::FORECAST_DAYS,
+                'seven_day_forecast' => count($daily) >= self::FORECAST_DAYS,
             ],
         ];
     }
@@ -213,11 +233,11 @@ class VisualCrossingProvider implements WeatherProvider
      * @param  array<string,mixed>  $hour
      * @return array<string,mixed>
      */
-    private function normalizeHour(array $hour, int $offset, string $locale): array
+    private function normalizeHour(array $hour, int $offsetSeconds, ?string $dayDate, string $locale): array
     {
         $isDay = $this->isDay((string) ($hour['icon'] ?? ''));
         [$main, $key] = self::ICONS[$hour['icon'] ?? ''] ?? ['Clouds', 'overcast'];
-        $timestamp = $this->timestamp((string) $hour['datetime'], $offset);
+        $timestamp = $this->instant($hour, $dayDate, $offsetSeconds);
 
         return [
             'timestamp' => $timestamp,
@@ -291,40 +311,119 @@ class VisualCrossingProvider implements WeatherProvider
     }
 
     /**
-     * The location-wide UTC offset (seconds) reported at the top level.
+     * UTC instant for a record: the provider's own epoch value wins when
+     * present, otherwise the record's local datetime is combined with its
+     * offset.
      *
-     * @param  array<string,mixed>  $payload
+     * @param  array<string,mixed>  $record
      */
-    private function locationOffset(array $payload): int
+    private function instant(array $record, ?string $dayDate, int $offsetSeconds): int
     {
-        return (int) ($payload['tzoffset'] ?? 0);
+        if (isset($record['datetimeEpoch']) && is_numeric($record['datetimeEpoch'])) {
+            return (int) $record['datetimeEpoch'];
+        }
+
+        return $this->localEpoch($this->localDateTime($record['datetime'] ?? null, $dayDate), $offsetSeconds);
     }
 
     /**
-     * The offset (in hours) that applies to a specific record, falling back to
-     * its parent day and then the location.
+     * UTC instant for a day-level astronomical event (sunrise/sunset), which
+     * Visual Crossing returns as a time-only string or an epoch.
+     *
+     * @param  array<string,mixed>  $day
+     */
+    private function eventEpoch(array $day, string $key, ?string $dayDate, int $offsetSeconds): ?int
+    {
+        $epochKey = $key.'Epoch';
+
+        if (isset($day[$epochKey]) && is_numeric($day[$epochKey])) {
+            return (int) $day[$epochKey];
+        }
+
+        $value = $day[$key] ?? null;
+
+        if (! is_string($value) || $value === '') {
+            return null;
+        }
+
+        return $this->localEpoch($this->localDateTime($value, $dayDate), $offsetSeconds);
+    }
+
+    /**
+     * @param  array<string,mixed>  $day
+     */
+    private function eventIso(array $day, string $key, ?string $dayDate, int $offsetSeconds): ?string
+    {
+        $epoch = $this->eventEpoch($day, $key, $dayDate, $offsetSeconds);
+
+        return $epoch === null ? null : CarbonImmutable::createFromTimestamp($epoch)->toIso8601String();
+    }
+
+    /**
+     * Visual Crossing returns hourly `datetime` and sunrise/sunset as
+     * time-only strings ("12:00:00"); only full datetimes are used as-is.
+     * Time-only values are anchored to their parent day (or the epoch).
+     */
+    private function localDateTime(mixed $value, ?string $dayDate): string
+    {
+        $value = is_string($value) ? $value : '';
+
+        if ($value === '') {
+            return $dayDate ?? '1970-01-01';
+        }
+
+        if (str_contains($value, 'T') || str_contains($value, '-')) {
+            return $value;
+        }
+
+        return ($dayDate ?? '1970-01-01').'T'.$value;
+    }
+
+    /**
+     * Convert a provider-local datetime to the underlying UTC UNIX timestamp.
+     */
+    private function localEpoch(string $localDateTime, int $offsetSeconds): int
+    {
+        return CarbonImmutable::parse($localDateTime, 'UTC')->getTimestamp() - $offsetSeconds;
+    }
+
+    /**
+     * The location-wide offset (seconds) reported at the top level.
+     *
+     * @param  array<string,mixed>  $payload
+     */
+    private function locationOffsetSeconds(array $payload): int
+    {
+        return (int) round(((float) ($payload['tzoffset'] ?? 0)) * 3600);
+    }
+
+    /**
+     * The offset (seconds) that applies to a specific record, preferring the
+     * provider's `offsetseconds` and falling back to the record -> day ->
+     * location `tzoffset` (which is reported in hours and may be fractional).
      *
      * @param  array<string,mixed>  $payload
      * @param  array<string,mixed>  $record
      * @param  array<string,mixed>  $parent
      */
-    private function offsetHours(array $payload, array $record, array $parent = []): int
+    private function offsetSeconds(array $payload, array $record, array $parent = []): int
     {
-        return (int) ($record['tzoffset'] ?? $parent['tzoffset'] ?? $payload['tzoffset'] ?? 0);
+        if (isset($record['offsetseconds']) && is_numeric($record['offsetseconds'])) {
+            return (int) $record['offsetseconds'];
+        }
+
+        $hours = $record['tzoffset'] ?? $parent['tzoffset'] ?? $payload['tzoffset'] ?? 0;
+
+        return (int) round(((float) $hours) * 3600);
     }
 
     /**
-     * @param  array<string,mixed>  $payload
+     * The start of the local hour containing the given instant, expressed as
+     * a UTC instant, so a current time of 12:30 selects the 12:00 bucket.
      */
-    private function currentTimestamp(array $payload, int $defaultOffset): int
+    private function floorToLocalHour(int $epoch, int $offsetSeconds): int
     {
-        $current = $payload['currentConditions'] ?? [];
-
-        if (is_array($current) && isset($current['datetime'])) {
-            return $this->timestamp((string) $current['datetime'], $this->offsetHours($payload, $current));
-        }
-
-        return 0;
+        return (int) (floor(($epoch + $offsetSeconds) / 3600) * 3600) - $offsetSeconds;
     }
 
     /**
@@ -342,22 +441,18 @@ class VisualCrossingProvider implements WeatherProvider
     }
 
     /**
-     * Convert a provider-local datetime to the underlying UTC UNIX timestamp.
+     * Visual Crossing reports visibility in kilometres (metric) or miles (us);
+     * the contract, like Open-Meteo, uses metres.
      */
-    private function timestamp(string $localDateTime, int $offsetHours): int
+    private function visibilityMeters(mixed $value, string $units): ?float
     {
-        return CarbonImmutable::parse($localDateTime, 'UTC')->subHours($offsetHours)->getTimestamp();
-    }
-
-    private function isoFromLocal(mixed $localDateTime, int $offsetHours): ?string
-    {
-        if (! is_string($localDateTime) || $localDateTime === '') {
+        if (! is_numeric($value)) {
             return null;
         }
 
-        return CarbonImmutable::createFromTimestamp(
-            $this->timestamp($localDateTime, $offsetHours)
-        )->toIso8601String();
+        $perUnit = $units === 'imperial' ? 1609.344 : 1000.0;
+
+        return round(((float) $value) * $perUnit, 1);
     }
 
     private function isDay(string $icon): bool

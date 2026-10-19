@@ -20,13 +20,13 @@ class VisualCrossingProviderTest extends TestCase
     /**
      * @return array<int,array<string,mixed>>
      */
-    private function hours(string $date, int $from, int $to): array
+    private function hours(int $from, int $to): array
     {
         $hours = [];
 
         for ($hour = $from; $hour <= $to; $hour++) {
             $hours[] = [
-                'datetime' => sprintf('%sT%02d:00:00', $date, $hour),
+                'datetime' => sprintf('%02d:00:00', $hour),
                 'temp' => 20,
                 'feelslike' => 19,
                 'humidity' => 40,
@@ -66,7 +66,7 @@ class VisualCrossingProviderTest extends TestCase
         $this->assertSame('visual_crossing', $current['provider']);
         $this->assertEquals(21.0, $current['temp']);
         $this->assertEquals(5, $current['uv_index']);
-        $this->assertEquals(10, $current['visibility']);
+        $this->assertSame(10000.0, $current['visibility']);
         $this->assertSame(10800, $current['timezone_offset']);
         $this->assertSame('01d', $current['icon']);
         $this->assertTrue($current['is_day']);
@@ -96,8 +96,8 @@ class VisualCrossingProviderTest extends TestCase
     public function test_hourly_window_crosses_midnight_to_cover_twenty_four_hours(): void
     {
         $fixture = $this->fixture();
-        $fixture['days'][0]['hours'] = $this->hours('2026-10-19', 12, 23);
-        $fixture['days'][1]['hours'] = $this->hours('2026-10-20', 0, 23);
+        $fixture['days'][0]['hours'] = $this->hours(12, 23);
+        $fixture['days'][1]['hours'] = $this->hours(0, 23);
         $this->fake($fixture);
 
         $hourly = $this->provider()->forecast(['lat' => 30.0444, 'lon' => 31.2357], 'metric', 'en')['hourly'];
@@ -109,10 +109,24 @@ class VisualCrossingProviderTest extends TestCase
         );
     }
 
+    public function test_the_current_hour_bucket_is_used_when_minutes_are_present(): void
+    {
+        $fixture = $this->fixture();
+        $fixture['currentConditions']['datetime'] = '2026-10-19T12:59:00';
+        $this->fake($fixture);
+
+        $hourly = $this->provider()->forecast(['lat' => 30.0444, 'lon' => 31.2357], 'metric', 'en')['hourly'];
+
+        $this->assertSame(
+            CarbonImmutable::parse('2026-10-19T12:00:00', 'UTC')->subHours(3)->timestamp,
+            $hourly[0]['timestamp'],
+        );
+    }
+
     public function test_a_record_level_timezone_offset_wins(): void
     {
         $fixture = $this->fixture();
-        $fixture['days'][0]['hours'][1]['tzoffset'] = 2;
+        $fixture['days'][0]['hours'][1]['tzoffset'] = 2.0;
         $this->fake($fixture);
 
         $hourly = $this->provider()->forecast(['lat' => 30.0444, 'lon' => 31.2357], 'metric', 'en')['hourly'];
@@ -121,6 +135,58 @@ class VisualCrossingProviderTest extends TestCase
             CarbonImmutable::parse('2026-10-19T13:00:00', 'UTC')->subHours(2)->timestamp,
             $hourly[1]['timestamp'],
         );
+    }
+
+    public function test_fractional_timezone_offsets_are_preserved(): void
+    {
+        $fixture = $this->fixture();
+        $fixture['tzoffset'] = 5.5;
+        $this->fake($fixture);
+
+        $provider = $this->provider();
+        $location = ['lat' => 30.0444, 'lon' => 31.2357];
+        $current = $provider->current($location, 'metric', 'en');
+        $hourly = $provider->forecast($location, 'metric', 'en')['hourly'];
+
+        $this->assertSame(19800, $current['timezone_offset']);
+        $this->assertSame(
+            CarbonImmutable::parse('2026-10-19T12:00:00', 'UTC')->subMinutes(330)->timestamp,
+            $hourly[0]['timestamp'],
+        );
+    }
+
+    public function test_the_daily_forecast_is_bounded_to_seven_days(): void
+    {
+        $fixture = $this->fixture();
+        $fixture['days'] = [];
+
+        for ($index = 0; $index < 15; $index++) {
+            $fixture['days'][] = [
+                'datetime' => CarbonImmutable::parse('2026-10-19', 'UTC')->addDays($index)->toDateString(),
+                'tempmin' => 10,
+                'tempmax' => 20,
+                'icon' => 'clear-day',
+                'hours' => [],
+            ];
+        }
+
+        $this->fake($fixture);
+
+        $daily = $this->provider()->forecast(['lat' => 30.0444, 'lon' => 31.2357], 'metric', 'en')['daily'];
+
+        $this->assertCount(7, $daily);
+    }
+
+    public function test_a_provider_epoch_is_preferred_over_local_datetime(): void
+    {
+        $fixture = $this->fixture();
+        $epoch = CarbonImmutable::parse('2026-10-19T09:30:00', 'UTC')->timestamp;
+        $fixture['days'][0]['hours'][0]['datetimeEpoch'] = $epoch;
+        $this->fake($fixture);
+
+        $hourly = $this->provider()->forecast(['lat' => 30.0444, 'lon' => 31.2357], 'metric', 'en')['hourly'];
+
+        $this->assertSame($epoch, $hourly[0]['timestamp']);
     }
 
     public function test_missing_optional_fields_normalize_to_null(): void

@@ -10,9 +10,53 @@ use Tests\TestCase;
 
 class FailoverWeatherServiceTest extends TestCase
 {
-    private function health(): ProviderHealth
+    private function health(int $threshold = 1): ProviderHealth
     {
-        return new ProviderHealth(threshold: 1, cooldownMinutes: 5);
+        return new ProviderHealth(threshold: $threshold, cooldownMinutes: 5);
+    }
+
+    /**
+     * A provider that blows up with a non-WeatherException error, as a bug in
+     * one provider's normalization would.
+     */
+    private function crashStub(string $name, \Throwable $error): object
+    {
+        return new class($name, $error) implements WeatherProvider
+        {
+            public int $calls = 0;
+
+            public function __construct(
+                private readonly string $providerName,
+                private readonly \Throwable $error,
+            ) {}
+
+            public function name(): string
+            {
+                return $this->providerName;
+            }
+
+            public function capabilities(): array
+            {
+                return ['plan' => $this->providerName];
+            }
+
+            public function current(array $location, string $units, string $locale): array
+            {
+                return $this->respond();
+            }
+
+            public function forecast(array $location, string $units, string $locale): array
+            {
+                return $this->respond();
+            }
+
+            private function respond(): array
+            {
+                $this->calls++;
+
+                throw $this->error;
+            }
+        };
     }
 
     /**
@@ -160,5 +204,40 @@ class FailoverWeatherServiceTest extends TestCase
         ], $this->health());
 
         $this->assertSame('open_meteo', $service->capabilities()['plan']);
+    }
+
+    public function test_a_normalization_crash_fails_over_to_the_next_provider(): void
+    {
+        $service = new FailoverWeatherService([
+            $this->crashStub('open_meteo', new \RuntimeException('boom')),
+            $this->stub('visual_crossing', ['provider' => 'visual_crossing']),
+        ], $this->health());
+
+        $this->assertSame(['provider' => 'visual_crossing'], $service->current([], 'metric', 'en'));
+    }
+
+    public function test_a_normalization_crash_is_rethrown_as_a_weather_exception(): void
+    {
+        $service = new FailoverWeatherService([
+            $this->crashStub('open_meteo', new \RuntimeException('boom')),
+        ], $this->health());
+
+        $this->expectException(WeatherException::class);
+
+        $service->current([], 'metric', 'en');
+    }
+
+    public function test_a_provider_that_failed_is_not_retried_within_the_same_request(): void
+    {
+        $first = $this->stub('open_meteo', null, 'errors.provider_unavailable');
+        $second = $this->stub('visual_crossing', ['provider' => 'visual_crossing']);
+
+        $service = new FailoverWeatherService([$first, $second], $this->health(threshold: 5));
+
+        $service->current([], 'metric', 'en');
+        $service->forecast([], 'metric', 'en');
+
+        $this->assertSame(1, $first->calls);
+        $this->assertSame(2, $second->calls);
     }
 }
