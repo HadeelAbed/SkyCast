@@ -28,6 +28,9 @@
         <env name="PULSE_ENABLED" value="false"/>
         <env name="QUEUE_CONNECTION" value="sync"/>
         <env name="SESSION_DRIVER" value="array"/>
+        <!-- Keep the failover provider absent so tests are deterministic even
+             when a real key exists in .env. -->
+        <env name="VISUAL_CROSSING_API_KEY" value=""/>
         <env name="TELESCOPE_ENABLED" value="false"/>
     </php>
 </phpunit>
