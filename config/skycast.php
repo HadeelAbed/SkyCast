@@ -74,4 +74,17 @@ return [
         'cooldown' => (int) env('SKYCAST_PROVIDER_BREAKER_COOLDOWN', 5),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Provider Order (failover)
+    |--------------------------------------------------------------------------
+    |
+    | Providers are tried left to right and the first success is used. Names
+    | that are not configured (for example Visual Crossing without an API key)
+    | are skipped automatically.
+    |
+    */
+
+    'provider_order' => array_values(array_filter(explode(',', env('SKYCAST_PROVIDER_ORDER', 'open_meteo,visual_crossing')))),
+
 ];
