@@ -2,8 +2,9 @@
 
 namespace App\Providers;
 
+use App\Services\Contracts\WeatherProvider;
 use App\Services\GeocodingService;
-use App\Services\WeatherService;
+use App\Services\Providers\OpenMeteoProvider;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\ServiceProvider;
 
@@ -30,10 +31,10 @@ class AppServiceProvider extends ServiceProvider
             );
         });
 
-        $this->app->singleton(WeatherService::class, function () {
+        $this->app->singleton(WeatherProvider::class, function () {
             $config = config('services.open_meteo');
 
-            return new WeatherService(
+            return new OpenMeteoProvider(
                 baseUrl: $config['forecast_url'],
                 timeout: $config['timeout'],
                 connectTimeout: $config['connect_timeout'],

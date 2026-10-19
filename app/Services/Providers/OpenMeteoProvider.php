@@ -1,8 +1,9 @@
 <?php
 
-namespace App\Services;
+namespace App\Services\Providers;
 
 use App\Exceptions\WeatherException;
+use App\Services\Contracts\WeatherProvider;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Cache;
@@ -22,7 +23,7 @@ use Throwable;
  * Nothing here invents data. Any value the provider omits stays null so the
  * view can render an honest "—".
  */
-class WeatherService
+class OpenMeteoProvider implements WeatherProvider
 {
     /**
      * WMO weather codes -> [condition category, translation key suffix].
@@ -66,6 +67,11 @@ class WeatherService
         private readonly int $cacheMinutes = 15,
         private readonly int $precision = 2,
     ) {}
+
+    public function name(): string
+    {
+        return 'open_meteo';
+    }
 
     /**
      * Which forecast features are available. Open-Meteo always provides true
@@ -113,6 +119,7 @@ class WeatherService
         [$main, $description] = $this->describe((int) ($current['weather_code'] ?? 3), $isDay, $locale);
 
         return [
+            'provider' => $this->name(),
             'temp' => $current['temperature_2m'] ?? null,
             'feels_like' => $current['apparent_temperature'] ?? null,
             'humidity' => $current['relative_humidity_2m'] ?? null,
@@ -201,6 +208,7 @@ class WeatherService
         }
 
         return [
+            'provider' => $this->name(),
             'hourly' => $hourly,
             'daily' => $daily,
             'timezone_offset' => $offset,
