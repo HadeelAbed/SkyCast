@@ -59,4 +59,32 @@ return [
 
     'coordinate_precision' => 2,
 
+    /*
+    |--------------------------------------------------------------------------
+    | Provider Circuit Breaker
+    |--------------------------------------------------------------------------
+    |
+    | After "threshold" consecutive failures a weather provider is marked down
+    | for "cooldown" minutes so failover skips it. A success resets the state.
+    |
+    */
+
+    'provider_breaker' => [
+        'threshold' => (int) env('SKYCAST_PROVIDER_BREAKER_THRESHOLD', 3),
+        'cooldown' => (int) env('SKYCAST_PROVIDER_BREAKER_COOLDOWN', 5),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Provider Order (failover)
+    |--------------------------------------------------------------------------
+    |
+    | Providers are tried left to right and the first success is used. Names
+    | that are not configured (for example Visual Crossing without an API key)
+    | are skipped automatically.
+    |
+    */
+
+    'provider_order' => array_values(array_filter(explode(',', env('SKYCAST_PROVIDER_ORDER', 'open_meteo,visual_crossing')))),
+
 ];

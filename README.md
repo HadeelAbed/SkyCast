@@ -2,7 +2,8 @@
 
 A Laravel weather app with live conditions, a 24-hour hourly forecast, a 7-day
 forecast, and an Arabic (RTL) / English (LTR) interface — backed by
-[Open-Meteo](https://open-meteo.com/) (key-less) and Nominatim for reverse
+[Open-Meteo](https://open-meteo.com/) (key-less) with automatic failover to
+[Visual Crossing](https://www.visualcrossing.com/weather-api) and Nominatim for
 geocoding.
 
 ## Features
@@ -11,8 +12,11 @@ geocoding.
   daily (7-day) forecasts, sunrise/sunset.
 - City search, browser geolocation, and remembering the last viewed location.
 - Metric / imperial units and a full English ⇄ Arabic (RTL) UI.
+- Automatic provider failover with a per-provider circuit breaker, so a single
+  provider's outage (rate limit, 5xx, timeout) degrades gracefully.
 - Server-side caching; failures degrade gracefully with localized messages.
-- No API key required.
+- No API key required. An optional, free Visual Crossing key enables the
+  fallback provider.
 
 ## Requirements
 

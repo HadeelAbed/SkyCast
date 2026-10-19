@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Exceptions\WeatherException;
+use App\Services\Contracts\WeatherProvider;
 use App\Services\GeocodingService;
-use App\Services\WeatherService;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 use Illuminate\View\View;
@@ -20,7 +20,7 @@ class WeatherController extends Controller
 {
     public function __construct(
         private readonly GeocodingService $geocoder,
-        private readonly WeatherService $weather,
+        private readonly WeatherProvider $weather,
     ) {}
 
     /**
@@ -160,6 +160,7 @@ class WeatherController extends Controller
                 'lon' => $location['lon'],
             ],
             'current' => $current,
+            'provider' => $current['provider'] ?? null,
             'hourly' => $hourly,
             'daily' => $daily,
             // The city's UTC offset drives every local-time display in Blade.
@@ -189,6 +190,7 @@ class WeatherController extends Controller
         return [
             'location' => null,
             'current' => null,
+            'provider' => null,
             'hourly' => [],
             'daily' => [],
             'timezone_offset' => null,

@@ -26,9 +26,10 @@ Browser (Blade + JS)
    ▼
 WeatherController / LanguageController     ← validates input, builds the view contract
    ▼
-GeocodingService + WeatherService          ← talk to Open-Meteo, normalize, cache, handle errors
+GeocodingService + WeatherProvider          ← normalize, cache, handle errors, fail over
    ▼
-Open-Meteo API  (server-side only — no key, nothing sensitive reaches the browser)
+Open-Meteo → Visual Crossing (failover)     ← server-side only; no key needed, nothing sensitive
+                                              reaches the browser
 ```
 
 The controller never performs HTTP itself and the services never build Blade
@@ -169,6 +170,9 @@ and it keeps translation lookup in one place (`__($e->errorKey)`).
 Forward geocoding uses the Open-Meteo geocoding API; reverse geocoding uses
 Nominatim (OpenStreetMap), because Open-Meteo has no reverse endpoint.
 
+> **Update:** forward geocoding now falls back to Nominatim's search endpoint
+> when Open-Meteo fails (rate limit, outage). See §8.4.
+
 **What was implemented.**
 
 - `resolve(string $city, string $locale): array` — calls the Open-Meteo
@@ -219,7 +223,12 @@ vs. weather) can be reasoned about and cached separately, and it keeps the
 
 ---
 
-### 2.6 `app/Services/WeatherService.php` — **created**
+### 2.6 `app/Services/Providers/OpenMeteoProvider.php` — **created (later renamed)**
+
+> **Update:** originally `app/Services/WeatherService.php`. When multi-provider
+> failover was added (§8) it was renamed to `OpenMeteoProvider` and moved under
+> `app/Services/Providers/`, implementing the `WeatherProvider` interface. The
+> behaviour below is unchanged; it now also returns a `provider` key.
 
 **Purpose.** Fetch and normalize current conditions and forecasts. This is the
 only place that knows about Open-Meteo's response shapes and WMO weather codes.
@@ -791,11 +800,110 @@ flowchart TD
    this. Deploy `cloudflare/open-meteo-proxy.js` as a Worker and set
    `OPEN_METEO_FORECAST_URL` to `https://<worker>.workers.dev/v1/forecast`. The
    Worker qualifies as a Cloudflare user, so the limit is applied per user and the
-   429 disappears. No application code changes.
+   429 disappears. No application code changes. As a second line of defence, the
+   provider failover in §8 sends the same request to Visual Crossing when
+   Open-Meteo answers 429.
 
 ---
 
-## 8. Commands and verification
+## 8. Multi-provider weather with automatic failover
+
+SkyCast talks to weather through a single interface, `App\Services\Contracts\WeatherProvider`,
+so the controller never learns which provider answered. `App\Services\FailoverWeatherService`
+implements that interface and tries the configured providers in order.
+
+### 8.1 Components
+
+| Class | Responsibility |
+|---|---|
+| `Contracts\WeatherProvider` | `name()`, `capabilities()`, `current()`, `forecast()` — the shape every source must honour |
+| `Providers\OpenMeteoProvider` | Today's Open-Meteo logic (renamed from `WeatherService`); `name()` = `open_meteo` |
+| `Providers\VisualCrossingProvider` | Visual Crossing timeline API, normalized to the identical key shape; `name()` = `visual_crossing` |
+| `FailoverWeatherService` | Tries providers in order, returns the first success; `name()` = `failover` |
+| `ProviderHealth` | Per-provider circuit breaker (failure counter + cooldown) backed by `Cache` |
+
+Every provider adds a `provider` key to the arrays it returns, and the controller
+copies it into the Blade contract as `provider`, so the rendered page knows which
+source produced the data.
+
+### 8.2 Failover policy
+
+- **Order** comes from `SKYCAST_PROVIDER_ORDER` (default `open_meteo,visual_crossing`).
+  A provider whose key is empty (Visual Crossing without `VISUAL_CROSSING_API_KEY`)
+  is skipped entirely, so the app runs Open-Meteo-only with no configuration.
+- **Triggers**: any `WeatherException` — rate limit (429), 5xx, 401/403, timeout
+  (`ConnectionException`) or a malformed payload — moves to the next provider.
+  A non-`WeatherException` thrown while a provider normalizes its payload (a
+  provider bug) is converted to a malformed-response error, so it fails over
+  instead of surfacing a 500. Gaps in a *successful* response (`null` values)
+  do not trigger failover.
+- **Circuit breaker**: after `SKYCAST_PROVIDER_BREAKER_THRESHOLD` consecutive
+  failures (default 3) a provider is skipped for `SKYCAST_PROVIDER_BREAKER_COOLDOWN`
+  minutes (default 5). A single success resets the counter. If *every* provider is
+  down, the service still attempts them in order rather than leaving the user with
+  no weather; if all fail, the last error surfaces through the normal error path.
+- **Per request**: a provider that already failed for `current()` is not retried
+  for `forecast()` in the same render, so a total outage costs one round of
+  timeouts rather than two.
+
+### 8.3 Visual Crossing mapping
+
+- **Request**: `GET {url}/{lat},{lon}?key=...&unitGroup=metric|us&include=current,hours,days&contentType=json`.
+- **Time**: hourly `datetime` and daily `sunrise`/`sunset` are **time-only** strings
+  (`"12:00:00"`), so they are anchored to their day; `currentConditions.datetime`
+  is a full datetime. A record's own epoch (`datetimeEpoch`, `sunriseEpoch`,
+  `sunsetEpoch`, `offsetseconds`) is preferred when present. Records carry a
+  `tzoffset` in hours (possibly fractional, e.g. `5.5`); each is converted to the
+  underlying UTC instant, with a per-record offset (DST change) taking priority
+  over the day's and the location's. `timezone_offset` is the top-level
+  `tzoffset * 3600` (rounded). The 24-hour window starts at the local hour
+  containing the current time, so 12:30 selects the 12:00 bucket.
+- **Fields**: `temp`, `feelslike`, `humidity`, `pressure`, `windspeed`, `winddir`,
+  `visibility`, `cloudcover`, `uvindex` (current); `tempmin`/`tempmax`/`uvindex`/`sunrise`/`sunset`/`precipprob`
+  (daily); `temp`/`feelslike`/`humidity`/`windspeed`/`precipprob` (hourly).
+  `precipprob` (0–100) becomes `pop` (0–1). `visibility` is reported in kilometres
+  (`metric`) or miles (`us`) and is converted to metres to match Open-Meteo.
+  Missing fields normalize to `null`.
+- **Daily**: Visual Crossing defaults to 15 days; the provider trims to the 7-day
+  contract with `array_slice`.
+- **Icons**: Visual Crossing icons map to the same `weather.*` translation keys as
+  Open-Meteo's WMO codes; unknown icons fall back to `overcast`. `-night` sets
+  `is_day = false`.
+
+### 8.4 Geocoding fallback
+
+Forward geocoding (`GeocodingService::resolve()`) uses Open-Meteo first and, on a
+provider/transport error or 429 (never on a genuine "no such city"), retries
+Nominatim's search endpoint (`OPEN_METEO_NOMINATIM_SEARCH_URL`). The two results are
+cached under separate keys so one Open-Meteo hiccup does not pin the fallback answer
+for the whole cache lifetime. Reverse geocoding is unchanged (always Nominatim).
+
+### 8.5 Environment
+
+```
+SKYCAST_PROVIDER_ORDER=open_meteo,visual_crossing
+SKYCAST_PROVIDER_BREAKER_THRESHOLD=3
+SKYCAST_PROVIDER_BREAKER_COOLDOWN=5
+
+# Optional — enables the Visual Crossing failover provider:
+VISUAL_CROSSING_API_KEY=
+VISUAL_CROSSING_URL=https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline
+VISUAL_CROSSING_TIMEOUT=8
+VISUAL_CROSSING_CONNECT_TIMEOUT=5
+VISUAL_CROSSING_CACHE_FORECAST=15
+
+# Forward-geocoding fallback endpoint:
+OPEN_METEO_NOMINATIM_SEARCH_URL=https://nominatim.openstreetmap.org/search
+```
+
+**Manual step:** create a free Visual Crossing account
+(<https://www.visualcrossing.com/weather-api>), copy the key, and set
+`VISUAL_CROSSING_API_KEY` locally and on the Render service → **Environment** tab.
+Without it the app works exactly as before (Open-Meteo only).
+
+---
+
+## 9. Commands and verification
 
 > Every command below was run against this repository. Where a command was not
 > run, it is stated explicitly.
@@ -838,7 +946,7 @@ php artisan test
 Observed result:
 
 ```
-Tests:    23 passed (63 assertions)
+Tests:    48 passed (141 assertions)
 ```
 
 **6. Format changed files with Pint:**
@@ -878,17 +986,21 @@ php artisan route:list
 
 ---
 
-## 9. Change tracking
+## 10. Change tracking
 
 | File | Action | Purpose | Status |
 |---|---|---|---|
-| `config/services.php` | Modified | Open-Meteo forecast/geocoding/reverse endpoints, timeouts, cache TTLs | Tested |
-| `config/skycast.php` | Created | Supported locales, units (metric/imperial), default unit, cache coordinate precision | Tested |
+| `config/services.php` | Modified | Open-Meteo forecast/geocoding/reverse endpoints, timeouts, cache TTLs; Visual Crossing config; Nominatim search URL | Tested |
+| `config/skycast.php` | Created | Supported locales, units (metric/imperial), default unit, cache coordinate precision, provider order, circuit breaker | Tested |
 | `.env.example` | Modified | Document `OPEN_METEO_*` variables (no key); removed the leaked `OPENWEATHER_API_KEY` | Implemented |
 | `app/Exceptions/WeatherException.php` | Created | Provider error → translation key, no leaked details | Tested |
-| `app/Services/GeocodingService.php` | Created | City ⇄ coordinates (Open-Meteo + Nominatim), 24h cache | Tested |
-| `app/Services/WeatherService.php` | Created | Current + 24h hourly + 7-day daily, WMO mapping, single cached payload, capabilities | Tested |
-| `app/Providers/AppServiceProvider.php` | Modified | Bind services with config values | Tested |
+| `app/Services/GeocodingService.php` | Created | City ⇄ coordinates (Open-Meteo + Nominatim search fallback + reverse), 24h cache | Tested |
+| `app/Services/Contracts/WeatherProvider.php` | Created | Provider interface (`name`/`capabilities`/`current`/`forecast`) | Tested |
+| `app/Services/Providers/OpenMeteoProvider.php` | Renamed from `WeatherService.php` | Open-Meteo current + 24h hourly + 7-day daily, WMO mapping, single cached payload, capabilities | Tested |
+| `app/Services/Providers/VisualCrossingProvider.php` | Created | Visual Crossing timeline → identical normalized shape; time-only fields anchored to their day, epoch preferred, fractional tzoffset, visibility → metres, 7-day trim | Tested |
+| `app/Services/FailoverWeatherService.php` | Created | Tries providers in order, first success wins; normalization crashes fail over; per-request failure memory; rethrows the last error | Tested |
+| `app/Services/ProviderHealth.php` | Created | Per-provider circuit breaker (failure counter + cooldown) | Tested |
+| `app/Providers/AppServiceProvider.php` | Modified | Bind geocoding + failover weather provider with config values; force https in production | Tested |
 | `app/Http/Middleware/SetLocale.php` | Created | Apply session locale to each request | Tested |
 | `app/Http/Controllers/WeatherController.php` | Created | Validation, orchestration, view contract | Tested |
 | `app/Http/Controllers/LanguageController.php` | Created | Locale switch + safe redirect | Tested |
@@ -906,6 +1018,14 @@ php artisan route:list
 | `vite.config.js` | Modified | Add the `skycast.css`/`skycast.js` inputs | Tested |
 | `tests/Feature/WeatherTest.php` | Created | Open-Meteo backend behaviours (incl. saved-location home + auto-locate) with `Http::fake` | Tested |
 | `tests/Feature/LanguageTest.php` | Created | Locale switching and RTL/LTR behaviour | Tested |
+| `tests/Feature/ProviderBindingTest.php` | Created | Container resolves the failover weather provider | Tested |
+| `tests/Feature/VisualCrossingProviderTest.php` | Created | Visual Crossing normalization (time-only hours/sunrise/sunset, epoch preference, fractional tzoffset, 7-day bound, visibility conversion, missing fields) | Tested |
+| `tests/Feature/FailoverWeatherTest.php` | Created | End-to-end failover: primary 429 → fallback provider answers; no key → error surfaced | Tested |
+| `tests/Feature/GeocodingFallbackTest.php` | Created | Forward-geocoding fallback to Nominatim; empty result does not crash | Tested |
+| `tests/Unit/ProviderHealthTest.php` | Created | Circuit breaker threshold, per-provider isolation, reset on success | Tested |
+| `tests/Unit/FailoverWeatherServiceTest.php` | Created | Order, skip-when-down, all-down fallback, error propagation | Tested |
+| `tests/Support/VisualCrossingFixture.php` | Created | Shared Visual Crossing payload for the provider + failover tests | Tested |
+| `phpunit.xml` | Modified | Force an empty `VISUAL_CROSSING_API_KEY` so tests are deterministic | Implemented |
 | `tests/TestCase.php` | Modified | `withoutVite()` so views render without built assets | Tested |
 | `docs/backend-implementation-guide.md` | Created | This document | Implemented |
 
