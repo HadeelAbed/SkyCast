@@ -271,6 +271,7 @@ class WeatherTest extends TestCase
     {
         Http::fake([
             self::GEOCODE_URL => Http::response(['error' => 'boom'], 500),
+            '*nominatim.openstreetmap.org/search*' => Http::response(['error' => 'boom'], 500),
         ]);
 
         $response = $this->get(route('weather.search', ['city' => 'Cairo']));

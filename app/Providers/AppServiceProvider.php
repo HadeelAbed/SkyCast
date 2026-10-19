@@ -26,6 +26,7 @@ class AppServiceProvider extends ServiceProvider
             return new GeocodingService(
                 baseUrl: $config['geocoding_url'],
                 reverseUrl: $config['reverse_url'],
+                searchUrl: $config['nominatim_search_url'],
                 userAgent: $config['user_agent'],
                 timeout: $config['timeout'],
                 connectTimeout: $config['connect_timeout'],

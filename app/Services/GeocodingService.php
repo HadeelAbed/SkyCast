@@ -11,16 +11,18 @@ use Throwable;
 /**
  * Turns place names and coordinates into a normalized location structure.
  *
- * Forward geocoding uses the Open-Meteo geocoding API. Reverse geocoding uses
- * Nominatim (OpenStreetMap), because Open-Meteo does not offer a reverse
- * endpoint. Results are cached for roughly 24 hours because city coordinates
- * do not change.
+ * Forward geocoding uses the Open-Meteo geocoding API, falling back to
+ * Nominatim's search endpoint when Open-Meteo fails (rate limit, outage...).
+ * Reverse geocoding always uses Nominatim (OpenStreetMap), because Open-Meteo
+ * does not offer a reverse endpoint. Results are cached for roughly 24 hours
+ * because city coordinates do not change.
  */
 class GeocodingService
 {
     public function __construct(
         private readonly string $baseUrl,
         private readonly string $reverseUrl,
+        private readonly string $searchUrl = 'https://nominatim.openstreetmap.org/search',
         private readonly string $userAgent = 'SkyCast/1.0',
         private readonly int $timeout = 8,
         private readonly int $connectTimeout = 5,
@@ -31,34 +33,96 @@ class GeocodingService
     /**
      * Resolve a city name into coordinates.
      *
+     * Tries Open-Meteo first; on a provider/transport error or a rate limit it
+     * falls back to Nominatim's search endpoint. The two results are cached
+     * under separate keys so a single Open-Meteo hiccup does not pin the
+     * fallback answer for the whole cache lifetime.
+     *
      * @return array{name:?string,country:?string,state:?string,lat:float,lon:float,alternatives:int}
      *
-     * @throws WeatherException when the provider fails or no city matches.
+     * @throws WeatherException when every provider fails or no city matches.
      */
     public function resolve(string $city, string $locale): array
     {
         $normalized = mb_strtolower(trim($city));
-
         $key = sprintf('om:geo:direct:%s:%s', $locale, md5($normalized));
 
-        $result = Cache::remember($key, now()->addMinutes($this->cacheMinutes), function () use ($city, $locale) {
-            $payload = $this->request($this->baseUrl, [
-                'name' => $city,
-                'count' => 5,
-                'language' => $locale,
-                'format' => 'json',
-            ]);
+        $cached = Cache::get($key);
 
-            $results = $payload['results'] ?? [];
+        if (is_array($cached)) {
+            return $cached;
+        }
 
-            if (! is_array($results) || $results === []) {
-                throw new WeatherException('errors.city_not_found');
+        try {
+            $result = $this->normalizeResult($this->directResults($city, $locale), $locale);
+            Cache::put($key, $result, now()->addMinutes($this->cacheMinutes));
+
+            return $result;
+        } catch (WeatherException $e) {
+            if (! $this->shouldFallback($e)) {
+                throw $e;
             }
+        }
 
-            return $this->normalizeResult($results, $locale);
+        $fallbackKey = sprintf('om:geo:direct:fallback:%s:%s', $locale, md5($normalized));
+
+        return Cache::remember($fallbackKey, now()->addMinutes($this->cacheMinutes), function () use ($city, $locale) {
+            return $this->normalizeNominatim($this->nominatimResults($city, $locale));
         });
+    }
 
-        return $result;
+    /**
+     * Open-Meteo forward geocoding: the raw results list, or city_not_found.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    private function directResults(string $city, string $locale): array
+    {
+        $payload = $this->request($this->baseUrl, [
+            'name' => $city,
+            'count' => 5,
+            'language' => $locale,
+            'format' => 'json',
+        ]);
+
+        $results = $payload['results'] ?? [];
+
+        if (! is_array($results) || $results === []) {
+            throw new WeatherException('errors.city_not_found');
+        }
+
+        return $results;
+    }
+
+    /**
+     * Nominatim search: the raw results list.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    private function nominatimResults(string $city, string $locale): array
+    {
+        $payload = $this->request($this->searchUrl, [
+            'format' => 'jsonv2',
+            'q' => $city,
+            'limit' => 5,
+            'accept-language' => $locale,
+        ]);
+
+        return array_values(array_filter($payload, 'is_array'));
+    }
+
+    /**
+     * Only provider/transport errors and rate limits justify a fallback; a
+     * genuine "no such city" must not be retried against a second provider.
+     */
+    private function shouldFallback(WeatherException $e): bool
+    {
+        return in_array($e->errorKey, [
+            'errors.provider_unavailable',
+            'errors.provider_error',
+            'errors.malformed_response',
+            'errors.rate_limited',
+        ], true);
     }
 
     /**
@@ -128,6 +192,41 @@ class GeocodingService
             'state' => $first['admin1'] ?? null,
             'lat' => (float) $first['latitude'],
             'lon' => (float) $first['longitude'],
+            'alternatives' => count($usable),
+        ];
+    }
+
+    /**
+     * Shape a Nominatim search result into our internal location structure.
+     *
+     * @param  array<int,array<string,mixed>>  $results
+     * @return array{name:?string,country:?string,state:?string,lat:float,lon:float,alternatives:int}
+     */
+    private function normalizeNominatim(array $results): array
+    {
+        $usable = array_values(array_filter($results, static function ($entry) {
+            return is_array($entry) && isset($entry['lat'], $entry['lon']);
+        }));
+
+        if ($usable === []) {
+            throw new WeatherException('errors.city_not_found');
+        }
+
+        $first = $usable[0];
+        $address = is_array($first['address'] ?? null) ? $first['address'] : [];
+
+        $name = $this->firstOf($address, ['city', 'town', 'village', 'municipality', 'hamlet', 'county', 'state']);
+
+        if ($name === null && is_string($first['display_name'] ?? null)) {
+            $name = trim(explode(',', $first['display_name'])[0]);
+        }
+
+        return [
+            'name' => $name,
+            'country' => $address['country'] ?? null,
+            'state' => $address['state'] ?? ($address['region'] ?? null),
+            'lat' => (float) $first['lat'],
+            'lon' => (float) $first['lon'],
             'alternatives' => count($usable),
         ];
     }

@@ -56,6 +56,7 @@ return [
         'forecast_url' => env('OPEN_METEO_FORECAST_URL', 'https://api.open-meteo.com/v1/forecast'),
         'geocoding_url' => env('OPEN_METEO_GEOCODING_URL', 'https://geocoding-api.open-meteo.com/v1/search'),
         'reverse_url' => env('OPEN_METEO_REVERSE_URL', 'https://nominatim.openstreetmap.org/reverse'),
+        'nominatim_search_url' => env('OPEN_METEO_NOMINATIM_SEARCH_URL', 'https://nominatim.openstreetmap.org/search'),
         'user_agent' => env('OPEN_METEO_USER_AGENT', 'SkyCast/1.0'),
         'timeout' => (int) env('OPEN_METEO_TIMEOUT', 8),
         'connect_timeout' => (int) env('OPEN_METEO_CONNECT_TIMEOUT', 5),
