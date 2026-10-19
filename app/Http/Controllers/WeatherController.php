@@ -160,6 +160,7 @@ class WeatherController extends Controller
                 'lon' => $location['lon'],
             ],
             'current' => $current,
+            'provider' => $current['provider'] ?? null,
             'hourly' => $hourly,
             'daily' => $daily,
             // The city's UTC offset drives every local-time display in Blade.
@@ -189,6 +190,7 @@ class WeatherController extends Controller
         return [
             'location' => null,
             'current' => null,
+            'provider' => null,
             'hourly' => [],
             'daily' => [],
             'timezone_offset' => null,
